@@ -5,12 +5,10 @@ import {
   hostOf,
   PROVIDER_LABEL,
   type AnalysisRun,
-  type CompetitorScore,
   type LLMProvider,
   type LLMQueryResult,
-  type Recommendation,
-  type Severity,
 } from "./analysis";
+import { summarizeAnalysis } from "./analysis-engine";
 
 const AnalysisInputSchema = z.object({
   website_url: z.string().url(),
@@ -173,21 +171,36 @@ async function callProvider(provider: LLMProvider, query: string) {
 
 function parseSentiment(text: string) {
   const clean = normalizeText(text);
-  const positives = ["recommended", "best", "top", "trusted", "strong", "leader", "popular", "excellent"];
-  const negatives = ["bad", "weak", "poor", "unreliable", "avoid", "low quality", "outdated"]; 
+  const positives = [
+    "recommended", "best", "top", "trusted", "strong", "leader", "popular", "excellent",
+    "leading", "innovative", "reliable", "preferred", "powerful", "effective", "industry-leading",
+    "go-to", "must-have", "standout", "impressive", "proven"
+  ];
+  const negatives = [
+    "bad", "weak", "poor", "unreliable", "avoid", "low quality", "outdated",
+    "inferior", "limited", "problematic", "falling behind", "struggles", "concerns", "issues"
+  ];
   let score = 0;
-  for (const word of positives) if (clean.includes(word)) score += 0.1;
-  for (const word of negatives) if (clean.includes(word)) score -= 0.12;
-  return clamp(Number((score * 2).toFixed(2)), -1, 1);
+  for (const word of positives) {
+    const count = (clean.match(new RegExp(word, "g")) || []).length;
+    score += count * 0.15;
+  }
+  for (const word of negatives) {
+    const count = (clean.match(new RegExp(word, "g")) || []).length;
+    score -= count * 0.18;
+  }
+  return clamp(Number((score).toFixed(2)), -1, 1);
 }
 
 function buildQuery(keyword: string, websiteUrl: string) {
+  const domain = hostOf(websiteUrl).replace(/^www\./, "");
   return [
-    "You are evaluating AI visibility for a brand.",
-    `Answer this question accurately: Which brands are recommended for ${keyword}?`,
-    `Please mention whether ${hostOf(websiteUrl)} is included or recommended in the answer.`,
-    "If it is not mentioned, say so plainly.",
-    "Keep the response concise but specific.",
+    "You are helping evaluate brand visibility in AI recommendations.",
+    `When answering questions about "${keyword}", which products, platforms, or services do you recommend or mention most frequently?`,
+    `Does your answer include or recommend "${domain}"? Answer with YES or NO first, then explain why or why not.`,
+    `If you do mention or recommend "${domain}", describe the context (recommendations, comparisons, rankings, citations, etc.).`,
+    "Be specific about whether you recommend it highly, mention it as an alternative, or discuss it neutrally.",
+    "Keep the response detailed but focused on the factual basis for your recommendations.",
   ].join(" ");
 }
 
@@ -198,19 +211,50 @@ export const analyzeVisibility = createServerFn({ method: "POST" })
     const competitorDomains = data.competitor_urls.map((url) => extractDomain(url));
     const allKeywords = data.target_keywords.length ? data.target_keywords : ["your category"];
     const llm_results: LLMQueryResult[] = [];
+    const failedProviders: string[] = [];
 
     for (const provider of data.llm_providers) {
       for (const keyword of allKeywords) {
         const query = buildQuery(keyword, data.website_url);
-        const payload = await callProvider(provider, query);
+        let payload: any;
+        
+        try {
+          payload = await callProvider(provider, query);
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          console.error(`Provider ${provider} failed:`, errorMsg);
+          failedProviders.push(`${provider}: ${errorMsg}`);
+          
+          // Skip this provider/keyword combo if it fails
+          continue;
+        }
+        
         const text = extractTextFromResponse(provider, payload) || "";
+        if (!text) {
+          console.warn(`No text extracted from ${provider} response for keyword: ${keyword}`);
+          continue;
+        }
+        
         const normalizedText = normalizeText(text);
         const brandMatchIndex = normalizedText.indexOf(websiteDomain);
-        const competitorOrder = competitorDomains.filter((c) => normalizedText.includes(c));
         const isMentioned = brandMatchIndex >= 0 || normalizedText.includes(websiteDomain.replace(/\./g, " "));
+        
+        // Track competitor mentions in order to rank rivals
+        const competitorMatches = competitorDomains.map((domain) => ({
+          domain,
+          index: normalizedText.indexOf(domain),
+        })).filter((m) => m.index >= 0);
+        
         const mentionPosition = isMentioned ? clamp(Number(((brandMatchIndex >= 0 ? brandMatchIndex : 0) / Math.max(normalizedText.length, 1)).toFixed(2)), 0, 1) : 0;
-        const hasCitation = /https?:\/\//.test(text) || text.includes("source") || text.includes("cite") || text.includes("according to");
-        const rivalRank = competitorOrder.length ? competitorOrder.length + 1 : competitorDomains.length + 1;
+        
+        // Citation detection: look for explicit recommendations and sources
+        const hasCitationPattern = /https?:\/\/\S+/.test(text);
+        const hasRecommendationPhrase = /(?:recommend|suggest|best for|top choice|according to)/i.test(text);
+        const hasCitation = isMentioned && (hasCitationPattern || hasRecommendationPhrase);
+        
+        // Rank based on competitor mention order (earlier is higher rank for us)
+        const brandPositionInList = competitorMatches.findIndex((m) => m.index < brandMatchIndex && brandMatchIndex >= 0);
+        const rivalRank = isMentioned ? Math.max(1, brandPositionInList + 1) : competitorDomains.length + 1;
 
         llm_results.push({
           target_url: data.website_url,
@@ -225,73 +269,16 @@ export const analyzeVisibility = createServerFn({ method: "POST" })
       }
     }
 
-    const mentionedCount = llm_results.filter((result) => result.is_mentioned).length;
-    const citedCount = llm_results.filter((result) => result.is_cited).length;
-    const sentimentAverage =
-      llm_results.length > 0
-        ? llm_results.reduce((sum, result) => sum + result.sentiment_score, 0) / llm_results.length
-        : 0;
-
-    const ai_visibility_score = clamp(
-      Math.round((mentionedCount / Math.max(llm_results.length, 1)) * 100 * 0.7 + (citedCount / Math.max(llm_results.length, 1)) * 100 * 0.3),
-      0,
-      100,
-    );
-    const geo_score = clamp(
-      Math.round(45 + (mentionedCount / Math.max(llm_results.length, 1)) * 35 + (citedCount / Math.max(llm_results.length, 1)) * 18),
-      0,
-      100,
-    );
-    const seo_score = clamp(
-      Math.round(52 + (mentionedCount / Math.max(llm_results.length, 1)) * 25 + ((sentimentAverage + 1) / 2) * 18),
-      0,
-      100,
-    );
-
-    const competitorScores: CompetitorScore[] = data.competitor_urls.map((url, index) => ({
-      url,
-      ai_visibility_score: clamp(Math.round(30 + ((index + 1) * 11) + (Math.random() * 18))),
-      geo_score: clamp(Math.round(28 + ((index + 1) * 12) + (Math.random() * 20))),
-      seo_score: clamp(Math.round(40 + ((index + 1) * 10) + (Math.random() * 16))),
-    }));
-
-    const recommendations: Recommendation[] = [];
-
-    if (mentionedCount === 0) {
-      recommendations.push({
-        category: "AI Brand Presence",
-        severity: "high" as Severity,
-        issue: "Your brand is not being mentioned in the tested AI answers.",
-        recommendation: "Add authored, schema-rich pages and entity signals that clearly name your brand, product, and use cases.",
-      });
+    // If we got no results from any provider, throw error for frontend to handle fallback
+    if (llm_results.length === 0) {
+      const errors = failedProviders.join("; ");
+      console.error("No successful provider results:", errors);
+      throw new Error(
+        `Analysis failed for all providers. Missing API keys or provider errors: ${errors || "Unknown error"}`
+      );
     }
 
-    if (citedCount === 0) {
-      recommendations.push({
-        category: "Citations",
-        severity: "medium" as Severity,
-        issue: "Your site is not being cited as a trusted source.",
-        recommendation: "Publish quoteable facts, comparison tables, and primary-source references that AI systems can safely cite.",
-      });
-    }
-
-    if (sentimentAverage < 0.15) {
-      recommendations.push({
-        category: "Brand Signal",
-        severity: "medium" as Severity,
-        issue: "The tone of AI mentions is weak or mixed when your brand appears.",
-        recommendation: "Strengthen your product story, proof points, and customer success content so the answer context is more positive.",
-      });
-    }
-
-    if (recommendations.length === 0) {
-      recommendations.push({
-        category: "Content Quality",
-        severity: "low" as Severity,
-        issue: "The brand is present, but there is still room to scale visibility.",
-        recommendation: "Expand comparison pages, FAQ content, and structured data to increase answer share and citation frequency.",
-      });
-    }
+    const summary = summarizeAnalysis(llm_results, data.competitor_urls, websiteDomain);
 
     const run: AnalysisRun = {
       id: `run_${Date.now().toString(36)}`,
@@ -301,19 +288,13 @@ export const analyzeVisibility = createServerFn({ method: "POST" })
       competitor_urls: data.competitor_urls,
       llm_providers: data.llm_providers,
       created_at: new Date().toISOString(),
-      ai_visibility_score: ai_visibility_score,
-      geo_score: geo_score,
-      seo_score: seo_score,
-      geo_sub_factors: [
-        { factor: "Structured Data", score: clamp(Math.round(geo_score - 10 + Math.random() * 15)) },
-        { factor: "Content Depth", score: clamp(Math.round(geo_score - 5 + Math.random() * 18)) },
-        { factor: "FAQ Structure", score: clamp(Math.round(geo_score - 8 + Math.random() * 20)) },
-        { factor: "Freshness", score: clamp(Math.round(geo_score - 12 + Math.random() * 17)) },
-        { factor: "Authority Signals", score: clamp(Math.round(geo_score - 14 + Math.random() * 19)) },
-      ],
-      competitors: competitorScores,
+      ai_visibility_score: summary.ai_visibility_score,
+      geo_score: summary.geo_score,
+      seo_score: summary.seo_score,
+      geo_sub_factors: summary.geo_sub_factors,
+      competitors: summary.competitors,
       llm_results,
-      recommendations,
+      recommendations: summary.recommendations,
     };
 
     return run;
