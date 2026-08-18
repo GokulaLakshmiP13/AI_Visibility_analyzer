@@ -97,7 +97,7 @@ function rng(seed: number) {
   };
 }
 
-const clamp = (n: number, min = 0, max = 100) => Math.max(min, Math.min(max, n));
+export const clamp = (n: number, min = 0, max = 100) => Math.max(min, Math.min(max, n));
 
 export function hostOf(url: string) {
   return url

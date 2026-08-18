@@ -23,6 +23,7 @@ import {
   saveRun,
   type LLMProvider,
 } from "@/lib/analysis";
+import { createAnalysisRun } from "@/lib/analysis-routes";
 
 const title = "AI Visibility Analyzer — See if ChatGPT recommends your brand";
 const description =
@@ -78,7 +79,7 @@ function LandingPage() {
     setList(list.map((v, i) => (i === index ? value : v)));
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!website.trim()) {
       toast.error("Website URL is required");
@@ -90,6 +91,28 @@ function LandingPage() {
     }
     setRunning(true);
     setStage(0);
+
+    try {
+      const input = {
+        website_url: website.trim(),
+        competitor_urls: competitors.map((c) => c.trim()).filter(Boolean),
+        target_keywords: keywords.map((k) => k.trim()).filter(Boolean),
+        industry_category: industry,
+        llm_providers: providers,
+      };
+
+      const run = await createAnalysisRun(input);
+
+      setTimeout(() => {
+        saveRun(run);
+        toast.success("Analysis complete");
+        navigate({ to: "/results" });
+      }, STAGES.length * 620 + 400);
+      return;
+    } catch (error) {
+      console.error("Live analysis failed, falling back to demo generator:", error);
+      toast.warning("Live model keys missing; using demo analysis data instead.");
+    }
 
     const run = generateAnalysis({
       website_url: website.trim(),
